@@ -1,0 +1,182 @@
+# Shared publish workflow for every Jade Studio repo (prototypes + homepage).
+# Static files only (HTML/CSS/JS/images/video). No secrets: the job proves who
+# it is with GitHub's OIDC identity token, and the jade-publisher Worker decides
+# what it may write.
+#
+#   push to main          ->  jadestudiohub.com/<client>/<project>/        (latest, overwritten)
+#   GitHub release "v3"   ->  jadestudiohub.com/<client>/<project>/v3/     (frozen, never overwritten)
+#   homepage repo (home)  ->  jadestudiohub.com/                           (latest only)
+#
+# Callers need:  permissions: { id-token: write, contents: read|write }
+
+name: Publish to jadestudiohub.com
+
+on:
+  workflow_call:
+
+env:
+  # ── Engineer: set once ────────────────────────────────────────────────────
+  PUBLISHER_URL: https://publish.jadestudiohub.com
+  # ──────────────────────────────────────────────────────────────────────────
+  AUDIENCE: jade-publisher
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: publish-${{ github.repository }}-${{ github.event.release.tag_name || 'latest' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Publish
+        id: pub
+        shell: python
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # --- publish client (start) ---
+          import concurrent.futures, hashlib, json, os, sys, threading, time
+          import urllib.error, urllib.parse, urllib.request
+
+          API = os.environ["PUBLISHER_URL"].rstrip("/")
+          SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          class Stop(Exception):
+              pass
+
+          def summary(text):
+              if SUMMARY:
+                  with open(SUMMARY, "a") as f:
+                      f.write(text)
+
+          # GitHub identity token, refreshed every 2 minutes (they live ~5).
+          _tok, _lock = {"value": None, "at": 0.0}, threading.Lock()
+          def token():
+              with _lock:
+                  if time.time() - _tok["at"] > 120:
+                      url, bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL"), os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+                      if not url or not bearer:
+                          raise Stop("This repo's publish.yml is missing 'id-token: write'. Copy the workflow from the prototype template again.")
+                      req = urllib.request.Request(url + "&audience=" + urllib.parse.quote(os.environ["AUDIENCE"]),
+                                                   headers={"Authorization": "bearer " + bearer})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          _tok.update(value=json.load(r)["value"], at=time.time())
+                  return _tok["value"]
+
+          def call(method, path, body=None, data=None, headers=None, params=None):
+              url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+              last = ""
+              for attempt in range(4):
+                  h = {"Authorization": "Bearer " + token(), **(headers or {})}
+                  payload = data
+                  if body is not None:
+                      payload, h["Content-Type"] = json.dumps(body).encode(), "application/json"
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, data=payload, method=method, headers=h), timeout=120) as r:
+                          return json.load(r)
+                  except urllib.error.HTTPError as e:
+                      try:
+                          last = json.load(e).get("error") or f"HTTP {e.code}"
+                      except Exception:
+                          last = f"HTTP {e.code}"
+                      if e.code < 500 and e.code != 429:
+                          raise Stop(last)
+                  except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                      last = str(e)
+                  time.sleep(2 * (attempt + 1))
+              raise Stop(f"Could not reach the publishing service ({last}). Re-run the workflow in a minute.")
+
+          def md5_of(path):
+              h = hashlib.md5()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def main():
+              # 1. jade.json
+              try:
+                  with open("jade.json") as f:
+                      cfg = json.load(f)
+              except FileNotFoundError:
+                  raise Stop("jade.json is missing. Copy it from the prototype template.")
+              except ValueError:
+                  raise Stop("jade.json has a typo (it isn't valid JSON). Look for a missing comma or quote mark.")
+              if cfg.get("home") is True:
+                  target = {"home": "true"}
+              else:
+                  version = os.environ.get("TAG", "") if os.environ["EVENT"] == "release" else "latest"
+                  target = {"client": str(cfg.get("client", "")), "project": str(cfg.get("project", "")), "version": version}
+              out = str(cfg.get("output", ".")).rstrip("/") or "."
+              if not os.path.isdir(out):
+                  raise Stop(f"The folder '{out}' named in jade.json doesn't exist.")
+
+              # 2. Files to publish (same exclusions as always; symlinks refused)
+              files = []
+              for root, dirs, names in os.walk(out):
+                  rel_root = os.path.relpath(root, out)
+                  if rel_root == ".":
+                      dirs[:] = [d for d in dirs if d not in (".git", ".github", "node_modules")]
+                  for name in dirs + names:
+                      if os.path.islink(os.path.join(root, name)):
+                          raise Stop(f"Shortcuts (symlinks) aren't allowed: {os.path.normpath(os.path.join(rel_root, name))}. Replace them with real files.")
+                  for name in names:
+                      rel = os.path.normpath(os.path.join(rel_root, name)).replace(os.sep, "/")
+                      if rel in ("jade.json", "README.md") or name in (".DS_Store", "Thumbs.db"):
+                          continue
+                      full = os.path.join(root, name)
+                      files.append({"path": rel, "size": os.path.getsize(full), "md5": md5_of(full), "full": full})
+              total = sum(f["size"] for f in files)
+              summary(f"### Publish size\n\n{len(files)} files, {total / 1048576:.1f} MB\n\n")
+              manifest = [{k: f[k] for k in ("path", "size", "md5")} for f in files]
+
+              # 3. Begin: the publisher checks everything and says which files changed
+              res = call("POST", "/v1/begin", body={**target, "files": manifest})
+              need = set(res["upload"])
+              print(f"{len(need)} of {len(files)} files changed")
+
+              # 4. Upload changed files (index.html last: it makes the version live)
+              def upload(f):
+                  with open(f["full"], "rb") as fh:
+                      data = fh.read()
+                  call("PUT", "/v1/file", data=data, params={**target, "path": f["path"]},
+                       headers={"x-jade-md5": f["md5"], "Content-Type": "application/octet-stream"})
+              todo = [f for f in files if f["path"] in need and f["path"] != "index.html"]
+              with concurrent.futures.ThreadPoolExecutor(8) as ex:
+                  list(ex.map(upload, todo))
+              for f in files:
+                  if f["path"] == "index.html" and "index.html" in need:
+                      upload(f)
+
+              # 5. Commit: removes files deleted from the repo (latest link only)
+              res = call("POST", "/v1/commit", body={**target, "files": manifest})
+              url = res["url"]
+              print(f"::notice title=Live::{url}")
+              summary(f"### ✅ Published\n\n**Link:** {url}\n")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"url={url}\n")
+
+          try:
+              main()
+          except Stop as e:
+              print(f"::error title=Not published::{e}")
+              summary(f"### ❌ Not published\n\n{e}\n")
+              sys.exit(1)
+          # --- publish client (end) ---
+
+      - name: Add the link to the release notes
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          URL: ${{ steps.pub.outputs.url }}
+          TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body -q .body || true)
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes "🔗 **Live link:** $URL"$'\n\n'"$body" \
+            || echo "(Could not add the link to the release notes; the publish itself succeeded.)"
