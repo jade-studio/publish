@@ -16,7 +16,7 @@ on:
 
 env:
   # ── Engineer: set once ────────────────────────────────────────────────────
-  PUBLISHER_URL: https://publish.jadestudiohub.com
+  PUBLISHER_URL: https://jade-publisher.jadestudio.workers.dev
   # ──────────────────────────────────────────────────────────────────────────
   AUDIENCE: jade-publisher
 
@@ -63,7 +63,7 @@ jobs:
                       if not url or not bearer:
                           raise Stop("This repo's publish.yml is missing 'id-token: write'. Copy the workflow from the prototype template again.")
                       req = urllib.request.Request(url + "&audience=" + urllib.parse.quote(os.environ["AUDIENCE"]),
-                                                   headers={"Authorization": "bearer " + bearer})
+                                                   headers={"Authorization": "bearer " + bearer, "User-Agent": "jade-publish/1"})
                       with urllib.request.urlopen(req, timeout=30) as r:
                           _tok.update(value=json.load(r)["value"], at=time.time())
                   return _tok["value"]
@@ -72,7 +72,7 @@ jobs:
               url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
               last = ""
               for attempt in range(4):
-                  h = {"Authorization": "Bearer " + token(), **(headers or {})}
+                  h = {"Authorization": "Bearer " + token(), "User-Agent": "jade-publish/1", **(headers or {})}
                   payload = data
                   if body is not None:
                       payload, h["Content-Type"] = json.dumps(body).encode(), "application/json"
